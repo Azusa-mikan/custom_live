@@ -8,3 +8,6 @@ dependencies = [
     "aiosqlite>=0.22.1",
     "fastapi[standard]>=0.141.1",
 ]
+
+[tool.fastapi]
+entrypoint = "src.api:app"

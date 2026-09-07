@@ -23,10 +23,10 @@
 ```bash
 uv sync          # 安装依赖（fastapi[standard]、aiosqlite）
 # 编辑 .env 填入直播地址
-uv run main.py   # 启动，默认 http://127.0.0.1:8000
+uv run main.py   # 启动，默认监听 0.0.0.0:8000（局域网内即可访问）
 ```
 
-> 注意：`main.py` 的自动重载只监听 `src/assets`（前端文件）。改后端（`src/*.py`、`main.py`）后需要手动重启；改 `webhook.json` 则无需重启，发送时会自动重载。
+> 注意：当前 `main.py` **不带自动重载**，改后端代码（`src/*.py`、`main.py`）后需手动重启；改 `webhook.json` 无需重启，发送时会自动重载。开发期想热重载可改用 `fastapi dev`（FastAPI CLI，随 `fastapi[standard]` 安装）。
 
 ## .env 配置
 

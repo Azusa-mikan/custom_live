@@ -157,6 +157,31 @@
       transition: opacity 180ms ease;
     }
     .video-placeholder[hidden] { opacity: 0; }
+    .video-placeholder p:empty { display: none; }
+    .video-clock { display: none; }
+    .video-placeholder.offline { background: #000; }
+    .video-placeholder.offline .progress,
+    .video-placeholder.message .progress { display: none; }
+    .video-placeholder.offline .video-clock {
+      display: grid;
+      gap: 6px;
+      justify-items: center;
+    }
+    .clock-time {
+      font-size: clamp(3rem, 8vw, 5rem);
+      font-weight: 600;
+      line-height: 1;
+      letter-spacing: 0.04em;
+      font-variant-numeric: tabular-nums;
+      color: #fff;
+      text-shadow: 0 2px 14px rgb(0 0 0 / 50%);
+    }
+    .clock-date {
+      font-size: 1.05rem;
+      letter-spacing: 0.1em;
+      color: rgb(255 255 255 / 80%);
+      text-shadow: 0 1px 8px rgb(0 0 0 / 45%);
+    }
     .progress {
       width: 52px;
       height: 52px;
@@ -253,6 +278,7 @@
       font-weight: 700;
       letter-spacing: 0.06em;
     }
+    .live-badge[hidden] { display: none; }
     .live-badge .live-dot {
       width: 7px;
       height: 7px;

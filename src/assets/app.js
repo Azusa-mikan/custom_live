@@ -12,12 +12,20 @@
     const videoPlaceholder = $("videoPlaceholder");
     const videoStatus = $("videoStatus");
     const videoDetail = $("videoDetail");
+    const liveBadge = $("liveBadge");
     const routeSelect = $("routeSelect");
     const messageList = $("messageList");
     const emptyMessages = $("emptyMessages");
     const toast = $("toast");
     const videoShell = $("videoShell");
     let hls;
+    let streamReady = false;
+    let readyTimer;
+    let firstFrameReady = false;
+    let firstFrameTimer;
+    let stallRetries = 0;
+    let lastSampleTime = 0;
+    let lastAdvanceAt = 0;
     let toastTimer;
     let controlsTimer;
 
@@ -32,6 +40,53 @@
     window.addEventListener("resize", syncChatHeight, { passive: true });
     syncChatHeight();
 
+    // —— debug 探针（仅 ?debug=1 启用）——
+    const DEBUG = new URLSearchParams(location.search).get("debug") === "1";
+    let dbgBox = null;
+    const dbgLog = (message) => {
+      if (!DEBUG) return;
+      if (!dbgBox) {
+        dbgBox = document.createElement("div");
+        dbgBox.style.cssText = [
+          "position:fixed", "right:8px", "bottom:8px", "z-index:9999",
+          "max-height:44vh", "width:min(560px, calc(100vw - 16px))",
+          "overflow:auto", "background:rgba(0,0,0,.85)", "color:#9ef",
+          "font:11px/1.5 ui-monospace,Consolas,monospace", "padding:8px 10px",
+          "border-radius:10px", "pointer-events:auto", "white-space:pre-wrap",
+        ].join(";");
+        document.body.append(dbgBox);
+      }
+      const now = new Date();
+      const line = document.createElement("div");
+      line.textContent =
+        `[${String(now.getHours()).padStart(2, "0")}:${String(now.getMinutes()).padStart(2, "0")}:${String(now.getSeconds()).padStart(2, "0")}.${String(now.getMilliseconds()).padStart(3, "0")}] ${message}`;
+      dbgBox.append(line);
+      while (dbgBox.childElementCount > 300) dbgBox.firstElementChild.remove();
+      dbgBox.scrollTop = dbgBox.scrollHeight;
+    };
+    if (DEBUG) {
+      const bufferedEnd = () => {
+        try {
+          const ranges = video.buffered;
+          if (!ranges.length) return "-";
+          let end = 0;
+          for (let i = 0; i < ranges.length; i++) end = Math.max(end, ranges.end(i));
+          return end.toFixed(2);
+        } catch {
+          return "?";
+        }
+      };
+      ["waiting", "stalled", "playing", "pause", "seeked", "seeking", "emptied",
+        "canplay", "loadedmetadata", "durationchange", "error", "ended",
+      ].forEach((eventName) => {
+        video.addEventListener(eventName, () => {
+          dbgLog(
+            `video:${eventName} t=${Number.isFinite(video.currentTime) ? video.currentTime.toFixed(2) : "?"} ` +
+            `bufEnd=${bufferedEnd()} readyState=${video.readyState} paused=${video.paused}`);
+        });
+      });
+    }
+
     const persistRoute = () => localStorage.setItem(ROUTE_KEY, state.route);
     const showToast = (message) => {
       toast.textContent = message;
@@ -40,11 +95,13 @@
       toastTimer = setTimeout(() => toast.classList.remove("visible"), 2400);
     };
     let autoplayMuted = false;
+    let suppressTap = false;
     const playWithFallback = () => {
       const play = video.play();
       if (play) {
         play.catch(() => {
           autoplayMuted = true;
+          dbgLog("autoplay 被拦截，静音重播");
           video.muted = true;
           updateVolumeUI();
           video.play().catch(() => {});
@@ -81,21 +138,118 @@
       $("likeButton").classList.toggle("liked", state.likes > 0);
     }
 
+    const clockTime = $("clockTime");
+    const clockDate = $("clockDate");
+    let clockTimer;
+    const WEEK_NAMES = ["周日", "周一", "周二", "周三", "周四", "周五", "周六"];
+    const pad2 = (n) => String(n).padStart(2, "0");
+    const renderClock = () => {
+      const now = new Date();
+      clockTime.textContent =
+        `${pad2(now.getHours())}:${pad2(now.getMinutes())}:${pad2(now.getSeconds())}`;
+      clockDate.textContent =
+        `${now.getFullYear()}年${now.getMonth() + 1}月${now.getDate()}日 ${WEEK_NAMES[now.getDay()]}`;
+    };
+    const stopClock = () => { clearTimeout(clockTimer); clockTimer = undefined; };
+    const startClock = () => {
+      stopClock();
+      renderClock();
+      const tick = () => {
+        renderClock();
+        clockTimer = setTimeout(tick, 1000 - (Date.now() % 1000));
+      };
+      clockTimer = setTimeout(tick, 1000 - (Date.now() % 1000));
+    };
+    // LIVE 徽标显隐：用内联样式控制（display 规则不受 CSS 加载/缓存影响）
+    const setBadgeVisible = (visible) => {
+      liveBadge.style.display = visible ? "" : "none";
+      liveBadge.hidden = !visible;
+    };
+    // placeholder 三种视觉态：loading(转圈) / offline(未推流时钟) / message(文字提示)
+    const setPlaceholderState = (mode) => {
+      videoPlaceholder.classList.toggle("offline", mode === "offline");
+      videoPlaceholder.classList.toggle("message", mode === "message");
+    };
+    const markPlaying = () => {
+      streamReady = true;
+      setBadgeVisible(true);
+      firstFrameReady = false;
+      dbgLog("→ markPlaying：manifest 就绪");
+      lastSampleTime = 0;
+      lastAdvanceAt = 0;
+      clearTimeout(readyTimer);
+      clearTimeout(firstFrameTimer);
+      stopClock();
+      setPlaceholderState("loading");
+      videoPlaceholder.hidden = true;
+      // manifest 已就绪但可能还没有可播分片（冷启动/刚推流），
+      // 没出首帧则按停滞处理。2s 对照实验证明：重载能出画面但首几秒分片会引发
+      // video error，稳定窗口在 2~10s 之间，10s 是已验证的可靠值
+      firstFrameTimer = setTimeout(onStallTimeout, 10000);
+    };
+    const enterOffline = () => {
+      setBadgeVisible(false);
+      firstFrameReady = false;
+      dbgLog("→ enterOffline：进入离线时钟");
+      clearTimeout(readyTimer);
+      clearTimeout(firstFrameTimer);
+      stopClock();
+      setPlaceholderState("offline");
+      videoPlaceholder.hidden = false;
+      startClock();
+    };
+    // 就绪兜底：开始加载后若迟迟拿不到流（网络瞬断/源挂起等非 4xx 场景），
+    // 不依赖 hls.js 何时报错，超时后强制切到离线时钟
+    const scheduleReadyGuard = () => {
+      clearTimeout(readyTimer);
+      readyTimer = setTimeout(() => {
+        if (streamReady) return;
+        dbgLog("→ readyGuard：12s 未就绪");
+        if (hls) { hls.destroy(); hls = undefined; }
+        enterOffline();
+      }, 12000);
+    };
+    // 首帧停滞处理：manifest 就绪后迟迟没出画面（hls.js 卡在空 playlists 上不自愈）。
+    // 自动重载当前线路（不清零计数），同一线路累计 2 次仍失败则转离线时钟。
+    const onStallTimeout = () => {
+      if (firstFrameReady) return;
+      if (document.hidden) { // 后台标签页播放不推进，延后再查而不是误重载
+        firstFrameTimer = setTimeout(onStallTimeout, 3000);
+        return;
+      }
+      stallRetries += 1;
+      dbgLog(`→ 首帧停滞 ${stallRetries}/2 次，重载当前线路`);
+      if (stallRetries > 2) {
+        if (hls) { hls.destroy(); hls = undefined; }
+        enterOffline();
+        return;
+      }
+      loadHls(liveRoutes[activeRouteIndex]);
+    };
+
     async function loadHls(url) {
+      dbgLog(`loadHls: ${url || "(空)"}`);
+      streamReady = false;
+      firstFrameReady = false;
+      clearTimeout(firstFrameTimer);
+      setBadgeVisible(false);
       if (hls) { hls.destroy(); hls = undefined; }
       video.removeAttribute("src");
       video.load();
+      stopClock();
+      videoStatus.textContent = "";
+      videoDetail.textContent = "";
+      setPlaceholderState("loading");
       videoPlaceholder.hidden = false;
-      videoStatus.textContent = "正在等待直播";
-      videoDetail.textContent = "选择线路后将自动连接";
       if (!url) {
-        videoStatus.textContent = "尚未配置直播地址";
-        videoDetail.textContent = "在 .env 的 STREAM_N 中填入 HLS 地址即可开始播放";
+        enterOffline();
         return;
       }
+      scheduleReadyGuard();
       if (video.canPlayType("application/vnd.apple.mpegurl")) {
         video.src = url;
-        video.addEventListener("loadedmetadata", () => videoPlaceholder.hidden = true, { once: true });
+        video.addEventListener("loadedmetadata", markPlaying, { once: true });
+        video.addEventListener("error", () => { if (!streamReady) enterOffline(); });
         playWithFallback();
         return;
       }
@@ -106,16 +260,52 @@
           hls = new Hls({ enableWorker: true });
           hls.loadSource(url);
           hls.attachMedia(video);
-          hls.on(Hls.Events.MANIFEST_PARSED, () => { videoPlaceholder.hidden = true; playWithFallback(); });
+          if (DEBUG) {
+            hls.on(Hls.Events.LEVEL_LOADED, (_event, data) => {
+              const d = data.details;
+              dbgLog(
+                `LEVEL_LOADED #${data.level} sn[${d.startSN}..${d.endSN}] n=${d.fragments.length} ` +
+                `dur=${(d.totalduration || 0).toFixed(2)}s live=${d.live} target=${d.targetduration || 0}s ` +
+                `${d.advanced ? "advanced" : d.updated ? "updated" : "MISSED"}`);
+            });
+            hls.on(Hls.Events.FRAG_LOADING, (_event, data) => {
+              dbgLog(`FRAG_LOADING #${data.frag.sn}`);
+            });
+            hls.on(Hls.Events.FRAG_BUFFERED, (_event, data) => {
+              dbgLog(`FRAG_BUFFERED #${data.frag.sn}`);
+            });
+          }
+          hls.on(Hls.Events.MANIFEST_PARSED, () => { markPlaying(); playWithFallback(); });
           hls.on(Hls.Events.LEVEL_SWITCHED, () => {
             if (!videoInfo.hidden) refreshVideoInfo();
           });
-          hls.on(Hls.Events.ERROR, (_, data) => { if (data.fatal) { videoStatus.textContent = "直播连接失败"; videoDetail.textContent = "请切换线路或稍后重试"; } });
+          hls.on(Hls.Events.ERROR, (_, data) => {
+            const errorStatus = data.response &&
+              (data.response.status ?? data.response.statusCode);
+            dbgLog(`ERROR ${data.type} ${data.details} fatal=${data.fatal} http=${errorStatus ?? "-"}`);
+            if (streamReady) {
+              // 已就绪后只在致命错误时回到离线时钟（播放中断流）
+              if (data.fatal) enterOffline();
+              return;
+            }
+            // 未就绪期间：
+            //  - fatal / HTTP 4xx（如 MediaMTX no-stream 404）→ 源不可用，停掉重试直接离线
+            //  - 超时/断网等瞬断错误 → 放行，交给 hls.js 自动重试；始终不就绪由 readyGuard 兜底
+            const status = data.response &&
+              (data.response.status ?? data.response.statusCode);
+            const failSource = data.fatal ||
+              (Number.isInteger(status) && status >= 400 && status < 500);
+            if (!failSource) return;
+            if (hls) { hls.destroy(); hls = undefined; }
+            enterOffline();
+          });
         } else {
+          setPlaceholderState("message");
           videoStatus.textContent = "浏览器不支持 HLS";
           videoDetail.textContent = "请使用支持 HLS 的浏览器打开";
         }
       } catch {
+        setPlaceholderState("message");
         videoStatus.textContent = "播放器加载失败";
         videoDetail.textContent = "请检查网络连接后重试";
       }
@@ -133,6 +323,7 @@
       activeRouteIndex = index;
       state.route = route;
       persistRoute();
+      stallRetries = 0; // 手动切换线路 = 一次全新的尝试，重置自动重载计数
       routeLabel.textContent = route;
       routeMenu.querySelectorAll(".route-option").forEach((option) => {
         const active = Number(option.dataset.index) === index;
@@ -204,6 +395,9 @@
       if (event.key === "Enter") { event.preventDefault(); confirmName(); }
     });
     nameInput.addEventListener("input", () => nameInput.classList.remove("invalid"));
+    document.addEventListener("keydown", (event) => {
+      if (event.key === "Escape" && !nameDialog.hidden) nameDialog.hidden = true;
+    });
     if (!identity) openNameDialog();
 
     $("messageForm").addEventListener("submit", (event) => {
@@ -259,6 +453,12 @@
     const ctrlMuteIcon = $("ctrlMute").querySelector("span");
     const ctrlVolume = $("ctrlVolume");
     const ctrlFullscreen = $("ctrlFullscreen");
+    const VOLUME_KEY = "mikan-live-volume";
+    // 音量持久化：刷新后沿用上次音量，而不是每次回到满格
+    const savedVolume = Number.parseFloat(localStorage.getItem(VOLUME_KEY) || "");
+    if (Number.isFinite(savedVolume) && savedVolume >= 0 && savedVolume <= 1) {
+      video.volume = savedVolume;
+    }
 
     const updatePlayUI = () => {
       const playing = !video.paused && !video.ended;
@@ -270,6 +470,7 @@
     const updateVolumeUI = () => {
       ctrlMuteIcon.textContent = video.muted || video.volume === 0 ? "volume_off" : "volume_up";
       ctrlVolume.value = String(Math.round(video.volume * 100));
+      localStorage.setItem(VOLUME_KEY, String(video.volume));
     };
     const isFullscreen = () => document.fullscreenElement === videoShell;
     const setControls = (visible) => {
@@ -284,6 +485,7 @@
       if (video.paused) video.play().catch(() => {}); else video.pause();
     };
     const handleVideoClick = () => {
+      if (suppressTap) { suppressTap = false; return; }
       if (autoplayMuted) {
         autoplayMuted = false;
         video.muted = false;
@@ -295,6 +497,40 @@
 
     video.addEventListener("play", () => { updatePlayUI(); setControls(true); });
     video.addEventListener("pause", () => { updatePlayUI(); setControls(true); });
+    video.addEventListener("playing", () => {
+      // 真正出过画面：停止首帧停滞计时，后续暂停/卡顿不再触发自动重载
+      firstFrameReady = true;
+      clearTimeout(firstFrameTimer);
+    });
+    // hls.js 对 live 播放列表永不判定 ended（见 base-stream-controller 的 _streamEnded），
+    // 因此"主播下播"在页面上的可观测现象是：buffer 耗尽后 currentTime 不再前进。
+    // 用一个推进 watchdog 探测：前台播放中若 12s 无任何进度即判定直播停滞 → 时钟。
+    const checkPlaybackStall = () => {
+      if (
+        !streamReady || !firstFrameReady ||
+        video.paused || document.hidden ||
+        !Number.isFinite(video.currentTime)
+      ) {
+        // 未就绪 / 未出过画面 / 用户暂停 / 后台：不累计停滞时间
+        if (!video.paused && !document.hidden && streamReady) {
+          lastSampleTime = video.currentTime;
+          lastAdvanceAt = Date.now();
+        }
+        return;
+      }
+      const advanced = Math.abs(video.currentTime - lastSampleTime) >= 0.05;
+      lastSampleTime = video.currentTime;
+      if (advanced) {
+        lastAdvanceAt = Date.now();
+        return;
+      }
+      if (Date.now() - lastAdvanceAt > 12000) {
+        dbgLog("→ 播放推进停滞 >12s，判定下播");
+        if (hls) { hls.destroy(); hls = undefined; }
+        enterOffline();
+      }
+    };
+    setInterval(checkPlaybackStall, 2000);
     video.addEventListener("volumechange", updateVolumeUI);
     video.addEventListener("click", handleVideoClick);
     centerPlay.addEventListener("click", togglePlay);
@@ -322,6 +558,14 @@
     videoShell.addEventListener("mouseenter", () => setControls(true));
     videoShell.addEventListener("mousemove", () => setControls(true));
     videoShell.addEventListener("mouseleave", () => setControls(false));
+    // 触屏：点一下画面唤出控制条（首次触摸不切换播放），控制条已在显示时再点画面才是播放/暂停
+    videoShell.addEventListener("pointerdown", (event) => {
+      if (event.pointerType !== "touch" || event.target !== video) return;
+      if (!playerControls.classList.contains("show")) suppressTap = true;
+      setControls(true);
+      clearTimeout(controlsTimer);
+      controlsTimer = setTimeout(() => setControls(false), 3200);
+    });
     updatePlayUI();
     updateVolumeUI();
     window.addEventListener("scroll", () => $("appBar").classList.toggle("scrolled", window.scrollY > 4), { passive: true });
