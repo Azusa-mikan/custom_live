@@ -31,14 +31,28 @@ uv run main.py   # 启动，默认监听 0.0.0.0:8000（局域网内即可访问
 ## .env 配置
 
 ```env
-LIVE_TITLE="my live"          # 页面标题 / <h1>
-STREAM_1="http://127.0.0.1:8888/mystream/index.m3u8?cookieCheck=1"
-STREAM_2="https://example.com/live/index.m3u8"   # 可继续加 STREAM_3 …
+LIVE_TITLE="custom live"              # 页面标题 / <h1>；留空或缺失则用默认 "custom live"
+STREAM_1="aaccgg"                     # 流名：指向本服务内建 /mtx 代理端点
+STREAM_2="https://example.com/live/index.m3u8"  # 带协议 = 外部完整地址，原样使用
+MEDIAMTX_URL="http://127.0.0.1:8888"  # /mtx 代理转发目标（默认本机回环）
+MEDIAMTX_CDN_SECRET=""                # MediaMTX CDN 密钥；留空则不注入 Bearer（普通透传）
 ```
 
-- 线路按 `STREAM_N` 从 1 递增读取，全部未配置时页面显示"尚未配置直播地址"。
-- 播放源为 HTTP（非 HTTPS）直连 MediaMTX 时，需在地址后追加 `?cookieCheck=1`（MediaMTX 的 HLS 防深链校验），例如：
-  `STREAM_1="http://192.168.1.190:8888/aaccgg/index.m3u8?cookieCheck=1"`
+- 线路按 `STREAM_N` 从 1 递增读取，可继续加 `STREAM_3`…；**值为空 = 该条禁用**（跳过但不影响后续序号）；全部未配置时页面显示"尚未配置直播地址"。
+- `STREAM_N` 的取值有两种：
+  - **无协议**（如 `aaccgg`）：视为流名，解析为内建端点 `/mtx/<流名>/index.m3u8`；未配置 `MEDIAMTX_CDN_SECRET` 时自动追加 `?cookieCheck=1`。按此约定**只写流名/路径，不要再带 `index.m3u8`**。
+  - **带协议**（`http(s)://…`）：外部完整地址，原样使用（旧的直连 MediaMTX 写法仍兼容）。
+- 所有配置项遵循统一规则：**缺失或值为空串一律视同"未设置"**，并回退各自默认值。
+
+## MediaMTX CDN 代理（/mtx）
+
+后端提供 `/mtx/{path:path}` 端点，把 HLS 请求转发到 `MEDIAMTX_URL` 指定的本机 MediaMTX（回环转发不计外网带宽）：
+
+- 配置了 `MEDIAMTX_CDN_SECRET` 时，代理会注入 `Authorization: Bearer <secret>`，使 MediaMTX 进入 **CDN 单会话模式**（isCDN）：所有观众共享同一路 muxer 与分片 URL，配合 CDN/CF 缓存 `.ts` 命中率高——"多人观看只花一份源上传"。此模式下 **不需要** `?cookieCheck=1`（mediaMTX 的 isCDN 分支优先于 cookieCheck 流程）。
+- 未配置 `MEDIAMTX_CDN_SECRET` 时，代理做普通透传（MediaMTX 默认 per-viewer 流程），此时内建线路 URL 会自动带上 `?cookieCheck=1` 以跳过首次 302。
+- `MEDIAMTX_URL` 默认 `http://127.0.0.1:8888`；MediaMTX 不在本机时可在 `.env` 里改成对应地址。
+
+> 想让"多个观众只吃一份源上传"，需要媒体端配合：在 MediaMTX 的配置里把 `hlsCDNSecret` 设为与 `MEDIAMTX_CDN_SECRET` 相同的值并重启。
 
 ## Webhook（聊天消息转发）
 
