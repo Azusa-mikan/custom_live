@@ -19,12 +19,8 @@
     <section class="stream-layout" aria-label="直播内容">
       <div class="video-column">
         <div class="video-shell" id="videoShell">
-          <video id="liveVideo" playsinline preload="metadata" aria-label="直播视频"></video>
+          <video id="liveVideo" playsinline preload="metadata" controls aria-label="直播视频"></video>
           <div class="video-placeholder" id="videoPlaceholder">
-            <svg class="progress" viewBox="0 0 48 48" aria-hidden="true">
-              <circle class="progress-track" cx="24" cy="24" r="20" pathLength="100"></circle>
-              <circle class="progress-active" cx="24" cy="24" r="20" pathLength="100"></circle>
-            </svg>
             <p class="placeholder-title" id="videoStatus"></p>
             <p class="placeholder-copy" id="videoDetail"></p>
             <div class="video-clock" aria-hidden="true">
@@ -36,23 +32,7 @@
             <button type="button" class="menu-item" id="infoMenuItem" role="menuitem">显示视频信息</button>
           </div>
           <div class="video-info" id="videoInfo" hidden></div>
-          <button type="button" class="player-center" id="centerPlay" aria-label="播放或暂停">
-            <span class="material-symbols-rounded">play_arrow</span>
-          </button>
-          <div class="player-controls" id="playerControls">
-            <button type="button" class="ctl-btn" id="ctrlPlay" aria-label="播放或暂停">
-              <span class="material-symbols-rounded">play_arrow</span>
-            </button>
-            <button type="button" class="ctl-btn" id="ctrlMute" aria-label="静音">
-              <span class="material-symbols-rounded">volume_up</span>
-            </button>
-            <input class="ctrl-volume" id="ctrlVolume" type="range" min="0" max="100" value="100" aria-label="音量">
-            <span class="player-spacer"></span>
-            <span class="live-badge" id="liveBadge"><span class="live-dot"></span>LIVE</span>
-            <button type="button" class="ctl-btn" id="ctrlFullscreen" aria-label="全屏">
-              <span class="material-symbols-rounded">fullscreen</span>
-            </button>
-          </div>
+          <span class="live-badge" id="liveBadge" style="display:none"><span class="live-dot"></span>LIVE</span>
         </div>
         <div class="under-row">
           <div class="row-left">

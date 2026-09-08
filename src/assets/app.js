@@ -24,10 +24,13 @@
     let firstFrameReady = false;
     let firstFrameTimer;
     let stallRetries = 0;
+    // 播放中元素级 error 的独立恢复计数：它与"等首帧超时"是两种失败形态，分开累计；
+    // 健康推进（见 checkPlaybackStall）或手动切线路时清零
+    let errorRetries = 0;
+    let recoverTimer;
     let lastSampleTime = 0;
     let lastAdvanceAt = 0;
     let toastTimer;
-    let controlsTimer;
 
     const syncChatHeight = () => {
       if (window.matchMedia("(max-width: 860px)").matches) {
@@ -95,7 +98,6 @@
       toastTimer = setTimeout(() => toast.classList.remove("visible"), 2400);
     };
     let autoplayMuted = false;
-    let suppressTap = false;
     const playWithFallback = () => {
       const play = video.play();
       if (play) {
@@ -103,7 +105,6 @@
           autoplayMuted = true;
           dbgLog("autoplay 被拦截，静音重播");
           video.muted = true;
-          updateVolumeUI();
           video.play().catch(() => {});
           showToast("自动播放被拦截，已静音播放，点一下画面恢复声音");
         });
@@ -182,9 +183,9 @@
       stopClock();
       setPlaceholderState("loading");
       videoPlaceholder.hidden = true;
-      // manifest 已就绪但可能还没有可播分片（冷启动/刚推流），
-      // 没出首帧则按停滞处理。2s 对照实验证明：重载能出画面但首几秒分片会引发
-      // video error，稳定窗口在 2~10s 之间，10s 是已验证的可靠值
+      // manifest 已就绪但 playing 迟迟不来（典型：playlist 空 / 源还没产出首片）。
+      // firstFrameReady 由 playing 事件置位；此超时只兜"playing 永不出现"的情况，
+      // 若出帧后立刻 video error 则交给 recoverFromVideoError
       firstFrameTimer = setTimeout(onStallTimeout, 10000);
     };
     const enterOffline = () => {
@@ -193,6 +194,7 @@
       dbgLog("→ enterOffline：进入离线时钟");
       clearTimeout(readyTimer);
       clearTimeout(firstFrameTimer);
+      clearTimeout(recoverTimer);
       stopClock();
       setPlaceholderState("offline");
       videoPlaceholder.hidden = false;
@@ -209,8 +211,9 @@
         enterOffline();
       }, 12000);
     };
-    // 首帧停滞处理：manifest 就绪后迟迟没出画面（hls.js 卡在空 playlists 上不自愈）。
-    // 自动重载当前线路（不清零计数），同一线路累计 2 次仍失败则转离线时钟。
+    // 等首帧超时：manifest 就绪后 10s 内 playing 事件始终未触发
+    // （hls.js 卡在空 playlists 上不自愈）。自动重载当前线路（不清零计数），
+    // 同一线路累计 2 次仍无首帧则转离线时钟。
     const onStallTimeout = () => {
       if (firstFrameReady) return;
       if (document.hidden) { // 后台标签页播放不推进，延后再查而不是误重载
@@ -218,7 +221,7 @@
         return;
       }
       stallRetries += 1;
-      dbgLog(`→ 首帧停滞 ${stallRetries}/2 次，重载当前线路`);
+      dbgLog(`→ 等首帧超时 ${stallRetries}/2 次，重载当前线路`);
       if (stallRetries > 2) {
         if (hls) { hls.destroy(); hls = undefined; }
         enterOffline();
@@ -226,12 +229,34 @@
       }
       loadHls(liveRoutes[activeRouteIndex]);
     };
+    // 出帧即崩：playing 已触发（firstFrameReady 置位，等首帧超时已被撤）后马上又 video error。
+    // 属 MSE 解码层元素级错误，hls.js 不监听 video 的 error、不会转发。
+    // 冷启动对照实验（2s/10s）证明它稳定出现在刚开播的头片上，重载几次能等到好片；
+    // 且错误导致 paused，推进 watchdog 也旁路，故需单独兜底：观察数秒未自愈则有限重载。
+    const recoverFromVideoError = () => {
+      if (!streamReady) return; // 就绪前错误由各加载分支负责（Safari 直接离线 / hls.js ERROR）
+      clearTimeout(recoverTimer);
+      dbgLog("→ video error（已就绪），观察是否自愈");
+      recoverTimer = setTimeout(() => {
+        if (!video.error || !video.paused) return; // 已自愈或正在缓冲中，不干预
+        errorRetries += 1;
+        dbgLog(`→ 错误持续 ${errorRetries}/3 次，重载当前线路`);
+        if (errorRetries > 3) {
+          if (hls) { hls.destroy(); hls = undefined; }
+          enterOffline();
+          return;
+        }
+        loadHls(liveRoutes[activeRouteIndex]);
+      }, 2000);
+    };
+    video.addEventListener("error", recoverFromVideoError);
 
     async function loadHls(url) {
       dbgLog(`loadHls: ${url || "(空)"}`);
       streamReady = false;
       firstFrameReady = false;
       clearTimeout(firstFrameTimer);
+      clearTimeout(recoverTimer);
       setBadgeVisible(false);
       if (hls) { hls.destroy(); hls = undefined; }
       video.removeAttribute("src");
@@ -324,6 +349,7 @@
       state.route = route;
       persistRoute();
       stallRetries = 0; // 手动切换线路 = 一次全新的尝试，重置自动重载计数
+      errorRetries = 0;
       routeLabel.textContent = route;
       routeMenu.querySelectorAll(".route-option").forEach((option) => {
         const active = Number(option.dataset.index) === index;
@@ -446,59 +472,24 @@
       .then((response) => response.json())
       .then((data) => { state.likes = data.likes; renderLikes(); })
       .catch(() => {});
-    const centerPlay = $("centerPlay");
-    const playerControls = $("playerControls");
-    const ctrlPlayIcon = $("ctrlPlay").querySelector("span");
-    const centerPlayIcon = centerPlay.querySelector("span");
-    const ctrlMuteIcon = $("ctrlMute").querySelector("span");
-    const ctrlVolume = $("ctrlVolume");
-    const ctrlFullscreen = $("ctrlFullscreen");
+    // 音量持久化：刷新后沿用上次音量（原生控件调音量时由 volumechange 监听写回）
     const VOLUME_KEY = "mikan-live-volume";
-    // 音量持久化：刷新后沿用上次音量，而不是每次回到满格
     const savedVolume = Number.parseFloat(localStorage.getItem(VOLUME_KEY) || "");
     if (Number.isFinite(savedVolume) && savedVolume >= 0 && savedVolume <= 1) {
       video.volume = savedVolume;
     }
-
-    const updatePlayUI = () => {
-      const playing = !video.paused && !video.ended;
-      const icon = playing ? "pause" : "play_arrow";
-      ctrlPlayIcon.textContent = icon;
-      centerPlayIcon.textContent = icon;
-      centerPlay.hidden = !(videoPlaceholder.hidden && !playing);
+    // autoplay 被浏览器拦截时已静音播放；首次点击画面解除静音并继续播放。
+    // 注意：带 controls 的视频，单击画面本身是"播放/暂停切换"的浏览器默认动作，
+    // 事件在默认动作之前触发，若不阻止会先 play()、再被 UA 切回暂停 → 有声却停住。
+    const handleVideoClick = (event) => {
+      if (!autoplayMuted) return;
+      event.preventDefault();
+      autoplayMuted = false;
+      video.muted = false;
+      video.play().catch(() => {});
     };
-    const updateVolumeUI = () => {
-      ctrlMuteIcon.textContent = video.muted || video.volume === 0 ? "volume_off" : "volume_up";
-      ctrlVolume.value = String(Math.round(video.volume * 100));
-      localStorage.setItem(VOLUME_KEY, String(video.volume));
-    };
-    const isFullscreen = () => document.fullscreenElement === videoShell;
-    const setControls = (visible) => {
-      playerControls.classList.toggle("show", visible);
-      videoShell.classList.toggle("hide-cursor", !visible);
-      clearTimeout(controlsTimer);
-      if (visible && isFullscreen()) {
-        controlsTimer = setTimeout(() => setControls(false), 2600);
-      }
-    };
-    const togglePlay = () => {
-      if (video.paused) video.play().catch(() => {}); else video.pause();
-    };
-    const handleVideoClick = () => {
-      if (suppressTap) { suppressTap = false; return; }
-      if (autoplayMuted) {
-        autoplayMuted = false;
-        video.muted = false;
-        updateVolumeUI();
-        return;
-      }
-      togglePlay();
-    };
-
-    video.addEventListener("play", () => { updatePlayUI(); setControls(true); });
-    video.addEventListener("pause", () => { updatePlayUI(); setControls(true); });
     video.addEventListener("playing", () => {
-      // 真正出过画面：停止首帧停滞计时，后续暂停/卡顿不再触发自动重载
+      // 真正出过画面：撤销等首帧超时，后续暂停/卡顿不再触发自动重载
       firstFrameReady = true;
       clearTimeout(firstFrameTimer);
     });
@@ -521,6 +512,7 @@
       const advanced = Math.abs(video.currentTime - lastSampleTime) >= 0.05;
       lastSampleTime = video.currentTime;
       if (advanced) {
+        errorRetries = 0; // 健康推进说明源已恢复，重置错误重载计数
         lastAdvanceAt = Date.now();
         return;
       }
@@ -531,43 +523,10 @@
       }
     };
     setInterval(checkPlaybackStall, 2000);
-    video.addEventListener("volumechange", updateVolumeUI);
+    video.addEventListener("volumechange", () => {
+      localStorage.setItem(VOLUME_KEY, String(video.volume));
+    });
     video.addEventListener("click", handleVideoClick);
-    centerPlay.addEventListener("click", togglePlay);
-    $("ctrlPlay").addEventListener("click", togglePlay);
-    $("ctrlMute").addEventListener("click", () => {
-      if (video.muted || video.volume === 0) {
-        video.muted = false;
-        if (video.volume === 0) video.volume = 0.5;
-      } else {
-        video.muted = true;
-      }
-    });
-    ctrlVolume.addEventListener("input", () => {
-      video.volume = Number(ctrlVolume.value) / 100;
-      video.muted = false;
-    });
-    ctrlFullscreen.addEventListener("click", () => {
-      if (document.fullscreenElement) document.exitFullscreen();
-      else videoShell.requestFullscreen();
-    });
-    document.addEventListener("fullscreenchange", () => {
-      if (isFullscreen()) setControls(true);
-      else setControls(false);
-    });
-    videoShell.addEventListener("mouseenter", () => setControls(true));
-    videoShell.addEventListener("mousemove", () => setControls(true));
-    videoShell.addEventListener("mouseleave", () => setControls(false));
-    // 触屏：点一下画面唤出控制条（首次触摸不切换播放），控制条已在显示时再点画面才是播放/暂停
-    videoShell.addEventListener("pointerdown", (event) => {
-      if (event.pointerType !== "touch" || event.target !== video) return;
-      if (!playerControls.classList.contains("show")) suppressTap = true;
-      setControls(true);
-      clearTimeout(controlsTimer);
-      controlsTimer = setTimeout(() => setControls(false), 3200);
-    });
-    updatePlayUI();
-    updateVolumeUI();
     window.addEventListener("scroll", () => $("appBar").classList.toggle("scrolled", window.scrollY > 4), { passive: true });
 
     const videoInfo = $("videoInfo");
@@ -615,10 +574,8 @@
       const rows = [
         ["线路", state.route],
         ["地址", liveRoutes[activeRouteIndex] || "—"],
-        ["分辨率", video.videoWidth && video.videoHeight ? `${video.videoWidth} × ${video.videoHeight}` : "—"],
+        ["分辨率", video.videoWidth && video.videoHeight ? `${video.videoWidth} x ${video.videoHeight}` : "—"],
         ["帧率", measuredFps ? `~${Math.round(measuredFps)} fps` : fpsFromLevel],
-        ["编码", level && level.videoCodec ? level.videoCodec : "—"],
-        ["码率", level && level.bitrate ? `${Math.round(level.bitrate / 1000)} kbps` : "—"],
       ];
       videoInfo.innerHTML = "";
       rows.forEach(([label, value]) => {
