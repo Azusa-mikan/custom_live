@@ -48,6 +48,20 @@ _DEFAULT_BODY = {
 # (文件 mtime, 规范化配置)。文件未改动时复用，避免每条消息都重新解析。
 _cache: tuple[float, list[dict]] | None = None
 
+# 同时在飞的 webhook 请求数上限。信号量必须等到事件循环启动后才真正有意义，
+# 所以这里定义为模块级常量 + 模块级信号量，所有 notify 复用同一把锁；
+# 若每次 notify 都新建信号量，限制就形同虚设。
+# 取 8 的理由：单连接限频 5 条/秒，配合 N 个目标峰值约 5N 并发；8 能在高刷屏时
+# 压住瞬时峰值、又不至于让正常消息排队过久。信号量只约束"同时在发"的请求数，
+# 不约束连接池（见下方 _send 仍按需创建 AsyncClient 的取舍说明）。
+_MAX_CONCURRENT = 8
+_sem = asyncio.Semaphore(_MAX_CONCURRENT)
+
+# 持有 fire-and-forget 任务的强引用。事件循环对 Task 仅持弱引用，
+# 若不保留引用，Task 可能在执行完成前被 GC 回收，导致 webhook 请求被静默丢弃、
+# 连日志都看不到。任务完成后会在回调里把自己移除，避免集合无限增长。
+_pending: set[asyncio.Task] = set()
+
 
 def _load_config() -> list[dict]:
     global _cache
@@ -136,27 +150,33 @@ def _is_json_content(headers: dict[str, str]) -> bool:
 
 
 async def _send_one(client: httpx.AsyncClient, cfg: dict, message: dict) -> None:
-    values = _build_values(message)
-    headers = dict(cfg["headers"])
-    json_mode = _is_json_content(headers)
-    kwargs: dict[str, Any] = {"headers": headers}
+    # 信号量约束同时在飞的请求数，避免刷屏时瞬间接入所有目标而打爆出站连接；
+    # 整个发送过程（含实际出站请求）都须在该上下文内，否则限制形同虚设。
+    async with _sem:
+        values = _build_values(message)
+        headers = dict(cfg["headers"])
+        json_mode = _is_json_content(headers)
+        kwargs: dict[str, Any] = {"headers": headers}
 
-    body = cfg["body"]
-    if body is None:
-        kwargs["json"] = _render_node(_DEFAULT_BODY, values, True)
-    elif isinstance(body, (dict, list)):
-        kwargs["json"] = _render_node(body, values, True)
-    else:
-        rendered = _render_node(str(body), values, json_mode)
-        kwargs["content"] = rendered.encode("utf-8")
+        body = cfg["body"]
+        if body is None:
+            kwargs["json"] = _render_node(_DEFAULT_BODY, values, True)
+        elif isinstance(body, (dict, list)):
+            kwargs["json"] = _render_node(body, values, True)
+        else:
+            rendered = _render_node(str(body), values, json_mode)
+            kwargs["content"] = rendered.encode("utf-8")
 
-    response = await client.request(
-        cfg["method"], cfg["url"], timeout=cfg["timeout"], **kwargs
-    )
-    if response.status_code >= 400:
-        logger.warning(
-            "webhook %s %s -> HTTP %s", cfg["method"], cfg["url"], response.status_code
+        response = await client.request(
+            cfg["method"], cfg["url"], timeout=cfg["timeout"], **kwargs
         )
+        if response.status_code >= 400:
+            logger.warning(
+                "webhook %s %s -> HTTP %s",
+                cfg["method"],
+                cfg["url"],
+                response.status_code,
+            )
 
 
 async def _send(items: list[dict], message: dict) -> None:
@@ -180,6 +200,16 @@ def notify(message: dict) -> None:
     if not items:
         return
     try:
-        asyncio.create_task(_send(items, dict(message)))
+        task = asyncio.create_task(_send(items, dict(message)))
     except RuntimeError:
         logger.warning("没有运行中的事件循环，webhook 未发送")
+        return
+    # 持强引用，防止任务在跑完前被 GC 回收而丢失发送（事件循环只持弱引用）
+    _pending.add(task)
+    # 任务完成后自行从集合移除，避免 _pending 无限增长；
+    # set.discard(task) 正好匹配回调的入参签名（回调会被传入 task 自身）。
+    # 这里不额外调用 task.exception() 取异常记日志——_send 内部已通过
+    # gather(return_exceptions=True) 取回每个目标的异常并记日志、外层 try/except
+    # 也兜底了整体异常，异常已被"取回"，不会触发 "Task exception was never retrieved"
+    # 警告；再取一次只会重复日志，反而干扰排查，故不做。
+    task.add_done_callback(_pending.discard)
