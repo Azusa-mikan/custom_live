@@ -14,6 +14,7 @@
 - 点赞计数（服务端持久化）
 - 首次进入弹窗设置昵称、是否共享 IP（之后可点设置按钮再次修改）
 - 聊天消息可选转发到外部 webhook（见下文）
+- Telegram 双向桥：主播私聊 bot 的消息可发到直播间，观众聊天可转发到主播 Telegram（见下文）
 - 右键菜单 + 视频信息面板：实时帧率（基于 `requestVideoFrameCallback` 实测）、码率/清晰度（随 `LEVEL_SWITCHED` 更新）、当前线路与地址
 
 ## 快速开始
@@ -21,7 +22,7 @@
 需要 Python ≥ 3.13 与 [uv](https://docs.astral.sh/uv/)。
 
 ```bash
-uv sync          # 安装依赖（fastapi[standard]、aiosqlite）
+uv sync          # 安装依赖（fastapi[standard]、aiosqlite、pyTelegramBotAPI）
 # 编辑 .env 填入直播地址
 uv run main.py   # 启动，默认监听 0.0.0.0:8000（局域网内即可访问）
 ```
@@ -36,12 +37,15 @@ STREAM_1="aaccgg"                     # 流名：指向本服务内建 /mtx 代�
 STREAM_2="https://example.com/live/index.m3u8"  # 带协议 = 外部完整地址，原样使用
 MEDIAMTX_URL="http://127.0.0.1:8888"  # /mtx 代理转发目标（默认本机回环）
 MEDIAMTX_CDN_SECRET=""                # MediaMTX CDN 密钥；留空则不注入 Bearer（普通透传）
+TELEGRAM_BOT_TOKEN=""                 # Telegram bot token；留空 = 关闭 Telegram 桥
+TELEGRAM_CHAT_ID=""                   # 主播的 chat id；留空 = 关闭 Telegram 桥
 ```
 
 - 线路按 `STREAM_N` 从 1 递增读取，可继续加 `STREAM_3`…；**值为空 = 该条禁用**（跳过但不影响后续序号）；全部未配置时页面显示"尚未配置直播地址"。
 - `STREAM_N` 的取值有两种：
   - **无协议**（如 `aaccgg`）：视为流名，解析为内建端点 `/mtx/<流名>/index.m3u8`；未配置 `MEDIAMTX_CDN_SECRET` 时自动追加 `?cookieCheck=1`。按此约定**只写流名/路径，不要再带 `index.m3u8`**。
   - **带协议**（`http(s)://…`）：外部完整地址，原样使用（旧的直连 MediaMTX 写法仍兼容）。
+- `TELEGRAM_BOT_TOKEN` 与 `TELEGRAM_CHAT_ID` 用于 Telegram 双向桥（见下文）。**该功能默认关闭，两者都配置才启用**；任一为空/缺失时既不启动轮询也不转发，且不会影响应用启动。
 - 所有配置项遵循统一规则：**缺失或值为空串一律视同"未设置"**，并回退各自默认值。
 
 ## MediaMTX CDN 代理（/mtx）
@@ -95,8 +99,29 @@ Body 模板可用的占位符：
 
 JSON 目标中占位符值会自动做 JSON 转义，消息里的引号/换行不会破坏 payload；`body` 也可写成字符串模板（用于 `text/plain` 等非 JSON 内容，此时不做转义）。
 
+## Telegram 双向桥
+
+在 `.env` 中同时配置 `TELEGRAM_BOT_TOKEN`（[BotFather](https://t.me/BotFather) 创建 bot 得到）与 `TELEGRAM_CHAT_ID`（主播的 chat id）后启用：
+
+- **Telegram → 直播间**：指定的主播私聊 bot 发送的**文本**消息，会以昵称"主播"写入 SQLite 并实时广播给所有观众；其他用户、非文本消息一律忽略。此方向**不**走 webhook。
+- **直播间 → Telegram**：观众在直播间的聊天消息会转发到该 `TELEGRAM_CHAT_ID`，格式为：
+
+  ```
+  {name} {ip}: {time}
+  {text}
+  ```
+
+  观众未勾选"共享 IP"时省略 ip，输出 `{name}: {time}`（无多余空格）。`{time}` 与 webhook 的时间格式一致（ISO 8601，服务器本地时区，精确到秒）。转发失败只记日志，不影响直播间聊天。
+
+说明：
+
+- **功能默认关闭，两个配置项都填写才启用**；任一为空/缺失即整体禁用（不轮询、不转发），且不会导致应用启动失败。
+- `TELEGRAM_CHAT_ID` 以**字符串**形式保存，并与 bot 返回的 `message.chat.id` 用字符串比较，因此群组/频道的负数 id 也能直接使用。
+- 主播消息正文上限 300 字符（与直播间聊天一致），超出截断，纯空白忽略。
+- bot 轮询在独立线程中进行，不会阻塞 Web API；关闭应用时会自动停止轮询。
+
 ## 播放与隐私备注
 
-- 直播间页面、聊天、点赞都在你自己的服务上；除你主动配置的 webhook 外不向任何第三方发数据。
-- 聊天消息若对方勾选了"共享 IP"，其来源 IP 会存入 SQLite 并可在 webhook 中使用；未勾选则 IP 字段为 NULL。
+- 直播间页面、聊天、点赞都在你自己的服务上；除你主动配置的 webhook 与 Telegram 桥外不向任何第三方发数据。
+- 聊天消息若对方勾选了"共享 IP"，其来源 IP 会存入 SQLite 并可在 webhook / Telegram 转发中使用；未勾选则 IP 字段为 NULL。
 

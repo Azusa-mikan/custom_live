@@ -12,7 +12,7 @@ from fastapi.responses import FileResponse, StreamingResponse
 from fastapi.templating import Jinja2Templates
 from starlette.requests import Request
 
-from src import sql, webhook
+from src import sql, telegram_bridge, webhook
 from src.config import LIVE_TITLE, MEDIAMTX_CDN_SECRET, MEDIAMTX_URL, STREAM_URLS
 
 
@@ -20,14 +20,32 @@ from src.config import LIVE_TITLE, MEDIAMTX_CDN_SECRET, MEDIAMTX_URL, STREAM_URL
 _mtx_client: httpx.AsyncClient | None = None
 
 
+async def _publish_host_message(text: str, created_at: int) -> None:
+    """把主播的 Telegram 消息当作直播聊天：写库后广播。
+
+    写库/广播逻辑与观众消息保持一致（昵称固定「主播」、不带 IP），
+    但刻意不走 webhook——主播消息不应再外发到其他 webhook 目标。
+    """
+    await sql.insert_message(text, created_at, name="主播", ip=None)
+    await _broadcast(
+        {"type": "message", "message": {"name": "主播", "text": text, "time": created_at}}
+    )
+
+
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
     global _mtx_client
     await sql.init_db()
     _mtx_client = httpx.AsyncClient(base_url=MEDIAMTX_URL, timeout=None)
+    # 在 init_db 之后启动 Telegram 桥，保证回调里的写库落地时表已就绪。
+    # 未配置或初始化失败时 start 内部为 no-op，不影响应用启动。
+    telegram_bridge.start(asyncio.get_running_loop(), _publish_host_message)
     try:
         yield
     finally:
+        # 先停桥（可能阻塞数秒 join 轮询线程），再做其余清理：确保停止后
+        # 不会再有主播消息回写已关闭的数据库。
+        telegram_bridge.stop()
         await _mtx_client.aclose()
         _mtx_client = None
         await sql.close_db()
@@ -50,6 +68,10 @@ ASSETS_DIR = Path(__file__).resolve().parent / "assets"
 templates = Jinja2Templates(directory=ASSETS_DIR)
 
 connections: set[WebSocket] = set()
+
+# 持有「观众消息 → Telegram」的 fire-and-forget 任务强引用；事件循环对 Task 仅持
+# 弱引用，不保留引用可能在跑完前被 GC 回收而使转发丢失。任务完成后自行移除。
+_telegram_tasks: set[asyncio.Task] = set()
 
 # 并发广播时单条 send_json 的最长等待时间（秒）：观众网络慢或写缓冲满会让
 # send_json 长时间挂起，超过该值即判定该连接失效并丢弃，避免拖垮全体观众。
@@ -347,6 +369,21 @@ async def websocket_endpoint(websocket: WebSocket):
                     "ip": ip if data.get("share_ip") else None,
                 }
             )
+            # 转发观众消息到 Telegram。用 fire-and-forget 任务而非 await：发送要走
+            # 网络，等待会拖慢紧随其后的广播。forward_message 内部已吞掉所有异常，
+            # 这里持强引用防止任务跑完前被 GC 回收（事件循环只持弱引用）。
+            task = asyncio.create_task(
+                telegram_bridge.forward_message(
+                    {
+                        "name": name,
+                        "text": text,
+                        "time": created_at,
+                        "ip": ip if data.get("share_ip") else None,
+                    }
+                )
+            )
+            _telegram_tasks.add(task)
+            task.add_done_callback(_telegram_tasks.discard)
             payload = {
                 "type": "message",
                 "message": {"name": name, "text": text, "time": created_at},

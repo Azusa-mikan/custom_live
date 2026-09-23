@@ -34,6 +34,14 @@ MEDIAMTX_CDN_SECRET = _env_value("MEDIAMTX_CDN_SECRET") or None
 # MediaMTX 上游地址（/mtx 代理的转发目标）。空值回退默认本机回环。
 MEDIAMTX_URL = _env_value("MEDIAMTX_URL", "http://127.0.0.1:8888")
 
+# Telegram 双向桥。bot token 为空/缺失视为功能关闭（None）；api.py 据此不启动轮询。
+TELEGRAM_BOT_TOKEN = _env_value("TELEGRAM_BOT_TOKEN") or None
+
+# 主播的 chat id。刻意按"字符串"保存：Telegram 群组/频道的 chat.id 是负数，
+# 用字符串与 message.chat.id 比较可原样匹配（避免 int 转换/精度问题）。
+# 与 token 一样，空/缺失即功能关闭。
+TELEGRAM_CHAT_ID = _env_value("TELEGRAM_CHAT_ID") or None
+
 
 def _load_stream_urls(env: dict[str, str]) -> list[str]:
     urls: list[str] = []
