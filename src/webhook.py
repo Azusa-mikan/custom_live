@@ -102,7 +102,11 @@ def _load_config() -> list[dict]:
     return normalized
 
 
-def _format_time(ms: Any) -> str:
+def format_time(ms: Any) -> str:
+    """把毫秒时间戳格式化为本地时区 ISO 8601（精确到秒）。
+
+    公开函数：供其他模块（如 Telegram 桥）复用，以保持时间格式一致。
+    """
     try:
         return datetime.fromtimestamp(int(ms) / 1000).astimezone().isoformat(
             timespec="seconds"
@@ -116,7 +120,7 @@ def _build_values(message: dict) -> dict[str, str]:
     return {
         "name": str(message.get("name") or ""),
         "text": str(message.get("text") or ""),
-        "time": _format_time(message.get("time")),
+        "time": format_time(message.get("time")),
         "ip": str(ip) if ip else "",
     }
 
