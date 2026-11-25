@@ -27,6 +27,8 @@ CREATE TABLE IF NOT EXISTS messages (
     created_at INTEGER NOT NULL
 );
 
+CREATE INDEX IF NOT EXISTS idx_messages_created_at ON messages (created_at);
+
 CREATE TABLE IF NOT EXISTS likes (
     id INTEGER PRIMARY KEY CHECK (id = 1),
     count INTEGER NOT NULL DEFAULT 0
@@ -101,6 +103,18 @@ async def list_messages(limit: int = 200) -> list[dict]:
         )
         rows = list(await cursor.fetchall())
     return [dict(row) for row in reversed(rows)]
+
+
+async def delete_messages_before(cutoff_ms: int) -> int:
+    """删除 created_at 早于 cutoff_ms（毫秒时间戳）的历史消息，返回删除条数。"""
+    async with _lock:
+        db = await get_db()
+        cursor = await db.execute(
+            "DELETE FROM messages WHERE created_at < ?",
+            (cutoff_ms,),
+        )
+        await db.commit()
+        return cursor.rowcount if cursor.rowcount and cursor.rowcount > 0 else 0
 
 
 async def get_likes() -> int:

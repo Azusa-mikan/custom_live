@@ -16,8 +16,43 @@ from src import sql, telegram_bridge, webhook
 from src.config import LIVE_TITLE, MEDIAMTX_CDN_SECRET, MEDIAMTX_URL, STREAM_URLS
 
 
+logger = logging.getLogger(__name__)
+
 # 复用的媒体代理客户端，lifespan 中创建/关闭
 _mtx_client: httpx.AsyncClient | None = None
+# 定时清理过期聊天消息的后台任务，lifespan 中创建/取消
+_cleanup_task: asyncio.Task | None = None
+
+# 聊天消息保留时长（3 天，单位秒）与定时清理周期（1 小时，单位秒）。
+# created_at 以毫秒时间戳存库，计算截止时间时统一乘以 1000。
+MESSAGE_RETENTION_SECONDS = 3 * 24 * 60 * 60
+MESSAGE_CLEANUP_INTERVAL = 3600
+
+
+async def _cleanup_expired_messages(
+    now_ms: int | None = None,
+    retention_seconds: int = MESSAGE_RETENTION_SECONDS,
+) -> int:
+    """删除超过保留时长（默认 3 天）的历史消息，返回实际删除条数。"""
+    current_ms = int(time.time() * 1000) if now_ms is None else now_ms
+    cutoff_ms = current_ms - retention_seconds * 1000
+    deleted = await sql.delete_messages_before(cutoff_ms)
+    if deleted:
+        logger.info("已清理 %d 条超过 3 天的历史消息", deleted)
+    return deleted
+
+
+async def _message_cleanup_loop(interval: float | None = None) -> None:
+    """后台周期性清理超过保留时长的聊天消息，单次异常只记日志不中断循环。"""
+    sleep_interval = MESSAGE_CLEANUP_INTERVAL if interval is None else interval
+    while True:
+        await asyncio.sleep(sleep_interval)
+        try:
+            await _cleanup_expired_messages()
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001 - 单次清理失败不影响后续周期任务
+            logger.warning("定时清理历史消息失败：%s", exc)
 
 
 async def _publish_host_message(text: str, created_at: int) -> None:
@@ -34,20 +69,34 @@ async def _publish_host_message(text: str, created_at: int) -> None:
 
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
-    global _mtx_client
+    global _mtx_client, _cleanup_task
     await sql.init_db()
-    _mtx_client = httpx.AsyncClient(base_url=MEDIAMTX_URL, timeout=None)
-    # 在 init_db 之后启动 Telegram 桥，保证回调里的写库落地时表已就绪。
-    # 未配置或初始化失败时 start 内部为 no-op，不影响应用启动。
-    telegram_bridge.start(asyncio.get_running_loop(), _publish_host_message)
     try:
+        # 启动后立即清理一次历史过期消息，避免服务重启后 3 天前的旧消息在首个周期前仍被回放。
+        try:
+            await _cleanup_expired_messages()
+        except Exception as exc:  # noqa: BLE001 - 清理失败不应阻塞服务启动
+            logger.warning("启动清理历史消息失败：%s", exc)
+        _cleanup_task = asyncio.create_task(_message_cleanup_loop())
+        _mtx_client = httpx.AsyncClient(base_url=MEDIAMTX_URL, timeout=None)
+        # 在 init_db 之后启动 Telegram 桥，保证回调里的写库落地时表已就绪。
+        # 未配置或初始化失败时 start 内部为 no-op，不影响应用启动。
+        telegram_bridge.start(asyncio.get_running_loop(), _publish_host_message)
         yield
     finally:
-        # 先停桥（可能阻塞数秒 join 轮询线程），再做其余清理：确保停止后
-        # 不会再有主播消息回写已关闭的数据库。
+        # 先停定时清理任务与 Telegram 桥，确保退出后不再访问即将关闭的数据库。
+        if _cleanup_task is not None:
+            _cleanup_task.cancel()
+            try:
+                await _cleanup_task
+            except asyncio.CancelledError:
+                pass
+            _cleanup_task = None
+        # 停桥可能阻塞数秒 join 轮询线程；停完后再关闭代理客户端与数据库连接。
         telegram_bridge.stop()
-        await _mtx_client.aclose()
-        _mtx_client = None
+        if _mtx_client is not None:
+            await _mtx_client.aclose()
+            _mtx_client = None
         await sql.close_db()
 
 
