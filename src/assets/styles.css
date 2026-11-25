@@ -625,13 +625,29 @@
     @media (max-width: 860px) {
       main { padding-top: 16px; }
       .stream-layout { grid-template-columns: 1fr; }
-      .chat-column { height: auto; }
-      .chat-shell { min-height: 430px; }
+      .chat-column {
+        height: 260px;
+        max-height: 260px;
+      }
+      .chat-shell { min-height: 0; }
+      .message-list {
+        min-height: 0;
+        padding: 14px 16px;
+        overscroll-behavior: contain;
+      }
+      .chat-compose {
+        flex: 0 0 68px;
+        padding-top: 12px;
+      }
       .under-row { padding-top: 12px; }
     }
     @media (max-width: 520px) {
       .app-bar { padding-inline: 16px; }
       main { padding-inline: 16px; }
       .video-shell { min-height: 220px; border-radius: 20px; }
+      .chat-column {
+        height: 220px;
+        max-height: 220px;
+      }
       .chat-shell { border-radius: 20px; }
     }
